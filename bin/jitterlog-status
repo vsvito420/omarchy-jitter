@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""jitterlog-status – fasst die Messungen für das Bar-Widget zusammen.
+
+Liest ~/.local/state/jitterlog/*.csv, holt bei Router-Messung die neuesten Zeilen frisch
+vom Router und schreibt ~/.local/state/jitterlog/widget.json.
+"""
+import fcntl, glob, json, os, sys
+from datetime import datetime
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from jitterlog_common import SPIKE, STATE, config, parse, router_tail  # noqa: E402
+
+OUT = os.path.join(STATE, "widget.json")
+TARGETS = ["lan", "isp", "game", "cloudflare"]
+
+
+def main():
+    cfg = config()
+    raw, error = {}, None
+    for f in sorted(glob.glob(os.path.join(STATE, "*.csv"))):
+        parse(open(f).read(), raw)
+    if cfg["ROUTER"]:
+        try:
+            parse(router_tail(cfg, f"{datetime.now():%Y-%m}", 800), raw)
+        except Exception as e:
+            error = str(e)
+
+    rows = [{"t": r[0], "ziel": r[1], "sent": r[2], "recv": r[3], "min": r[4], "med": r[5],
+             "p95": r[6], "max": r[7], "jit": r[8]} for r in raw.values()]
+    by = {t: sorted((r for r in rows if r["ziel"] == t), key=lambda r: r["t"]) for t in TARGETS}
+    now = datetime.now()
+
+    def age(r):
+        return (now - datetime.fromisoformat(r["t"])).total_seconds()
+
+    def summary(rs):
+        ok = [r for r in rs if r["recv"]]
+        sent = sum(r["sent"] for r in rs)
+        recv = sum(r["recv"] for r in rs)
+        if not ok:
+            return None
+        return {
+            "med": round(sorted(r["med"] for r in ok)[len(ok) // 2], 1),
+            "p95": round(sum(r["p95"] for r in ok) / len(ok), 1),
+            "max": max(r["max"] for r in ok),
+            "jit": round(sum(r["jit"] or 0 for r in ok) / len(ok), 1),
+            "loss": round(100 * (sent - recv) / sent, 2) if sent else 0,
+            "spikyMin": sum(1 for r in ok if r["max"] - r["min"] > SPIKE),
+            "minutes": len(rs),
+        }
+
+    targets = {}
+    for t, rs in by.items():
+        targets[t] = {"last": rs[-1] if rs else None, "hour": summary([r for r in rs if age(r) <= 3600]),
+                      "all": summary(rs)}
+
+    # Verlauf der letzten 3 h (Spielserver = was das Spiel spürt) und Tagesprofil (Provider = Ursache)
+    hist = [r for r in by["game"] if age(r) <= 3 * 3600]
+    profile = []
+    for h in range(24):
+        hs = [r for r in by["isp"] if r["recv"] and int(r["t"][11:13]) == h]
+        profile.append(round(sum(r["p95"] - r["min"] for r in hs) / len(hs), 1) if hs else None)
+
+    first = min((r["t"] for r in rows), default=None)
+    out = {
+        "checkedAt": now.isoformat(timespec="seconds"),
+        "error": error,
+        "mode": "router" if cfg["ROUTER"] else "pc",
+        "gameName": cfg["GAME_NAME"],
+        "since": first,
+        "days": round((now - datetime.fromisoformat(first)).total_seconds() / 86400, 1) if first else 0,
+        "targets": targets,
+        "history": [{"t": r["t"], "p95": r["p95"], "max": r["max"], "min": r["min"], "jit": r["jit"]} for r in hist if r["recv"]],
+        "profile": profile,
+    }
+    tmp = f"{OUT}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(out, f)
+    os.replace(tmp, OUT)
+
+
+if __name__ == "__main__":
+    # Das Widget läuft auf jedem Monitor -> gleichzeitige Aufrufe: nur einer arbeitet, die anderen gehen leise.
+    os.makedirs(STATE, exist_ok=True)
+    lock = open(os.path.join(STATE, ".status.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        sys.exit(0)
+    main()

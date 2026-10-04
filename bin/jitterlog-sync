@@ -1,0 +1,24 @@
+#!/bin/bash
+# Nur mit Router-Messung (ROUTER in ~/.config/jitterlog/config): spielt router/jitterlog.sh
+# auf den Router, richtet den Cron-Job (cru) wieder ein, falls er nach einem Neustart fehlt,
+# und kopiert die CSVs nach ~/.local/state/jitterlog/router-*.csv.
+set -euo pipefail
+DIR="$(dirname "$(realpath "$0")")"
+CONFIG="${JITTERLOG_CONFIG:-$HOME/.config/jitterlog/config}"
+DST="${JITTERLOG_STATE:-$HOME/.local/state/jitterlog}"
+ROUTER="" ROUTER_PORT=22 GAME_HOST=155.133.226.68
+# shellcheck source=/dev/null
+[[ -f "$CONFIG" ]] && source "$CONFIG"
+[[ -z "$ROUTER" ]] && { echo "Kein ROUTER in $CONFIG – nur PC-Messung, nichts zu tun."; exit 0; }
+export SSH_AUTH_SOCK=${SSH_AUTH_SOCK:-$XDG_RUNTIME_DIR/gcr/ssh}
+R=(ssh -p "$ROUTER_PORT" -o BatchMode=yes -o ConnectTimeout=10 -o LogLevel=ERROR "$ROUTER")
+mkdir -p "$DST"
+
+# Skript aktuell halten + Cron-Job sicherstellen
+"${R[@]}" "mkdir -p /jffs/jitterlog && cat > /jffs/jitterlog/jitterlog.sh && chmod +x /jffs/jitterlog/jitterlog.sh &&
+    cru d jitterlog; cru a jitterlog '* * * * * /jffs/jitterlog/jitterlog.sh $GAME_HOST'" < "$DIR/../router/jitterlog.sh"
+
+# CSVs kopieren
+for f in $("${R[@]}" 'ls /jffs/jitterlog/*.csv 2>/dev/null'); do
+	"${R[@]}" "cat $f" > "$DST/router-$(basename "$f")"
+done

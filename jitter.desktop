@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Name=Jitter
+Comment=Ping-Jitter zu Router, Provider und Spielserver – Verlauf, Vergleich, Tagesprofil
+Exec=@BIN@/jitter-app
+Terminal=false
+Type=Application
+Icon=network-wired
+StartupNotify=true

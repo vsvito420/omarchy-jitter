@@ -1,0 +1,525 @@
+#!/usr/bin/env python3
+"""jitter-app – Fenster mit allen jitterlog-Messungen (Verlauf, Vergleich der Ziele, Tagesprofil).
+
+Startet einen kleinen lokalen Server (127.0.0.1:8766) und öffnet die Seite als
+Omarchy-Web-App. Der Server beendet sich selbst, wenn das Fenster zu ist.
+Daten: ~/.local/state/jitterlog/*.csv (+ frische Zeilen vom Router, falls er mitmisst).
+"""
+import glob, http.server, json, os, socket, subprocess, sys, threading, time
+from datetime import datetime
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from jitterlog_common import STATE, config, parse, router_tail, ssh_env  # noqa: E402
+
+PORT = int(os.environ.get("JITTER_PORT", 8766))
+IDLE_EXIT = 45  # Sekunden ohne Abfrage -> Server beendet sich
+
+last_hit = time.time()
+cache = {"t": 0, "data": None}
+lock = threading.Lock()
+
+
+def fetch():
+    cfg = config()
+    rows, error = {}, None
+    for f in sorted(glob.glob(os.path.join(STATE, "*.csv"))):
+        parse(open(f).read(), rows)
+    if cfg["ROUTER"]:
+        try:
+            parse(router_tail(cfg, f"{datetime.now():%Y-%m}", 2400), rows)
+        except Exception as e:
+            error = f"{e} – zeige nur gespeicherte Daten"
+    cs2 = {}
+    for f in sorted(glob.glob(os.path.join(STATE, "cs2-*.txt"))):
+        for line in open(f):
+            r = line.rstrip("\n").split(",")
+            if len(r) == 5 and r[0] != "zeit":
+                cs2[r[0]] = r[1:4]
+    return {"rows": sorted(rows.values()), "cs2": sorted([k] + v for k, v in cs2.items()),
+            "mode": "router" if cfg["ROUTER"] else "pc", "gameName": cfg["GAME_NAME"],
+            "error": error, "now": datetime.now().isoformat(timespec="seconds")}
+
+
+def get_data():
+    with lock:
+        if time.time() - cache["t"] > 20 or cache["data"] is None:
+            cache["data"] = fetch()
+            cache["t"] = time.time()
+        return cache["data"]
+
+
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        global last_hit
+        last_hit = time.time()
+        if self.path.startswith("/data"):
+            body, ctype = json.dumps(get_data()).encode(), "application/json"
+        elif self.path.startswith("/alive"):
+            body, ctype = b"ok", "text/plain"
+        else:
+            body, ctype = PAGE.encode(), "text/html; charset=utf-8"
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def port_in_use():
+    with socket.socket() as s:
+        return s.connect_ex(("127.0.0.1", PORT)) == 0
+
+
+def serve():
+    # gespeicherte Daten im Hintergrund auffrischen (holt den ganzen Monat vom Router)
+    if config()["ROUTER"]:
+        subprocess.Popen([os.path.join(os.path.dirname(os.path.realpath(__file__)), "jitterlog-sync")],
+                         env=ssh_env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    while time.time() - last_hit < IDLE_EXIT:
+        time.sleep(5)
+    srv.shutdown()
+
+
+PAGE = r'''<!doctype html>
+<html lang="de"><head><meta charset="utf-8">
+<title>Jitter</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+:root{color-scheme:light;
+  --surface-0:#f4f4f2;--surface-1:#fcfcfb;--line:#e2e1dc;--grid:#ecebe7;
+  --text-primary:#0b0b0b;--text-secondary:#52514e;--text-muted:#8a8984;
+  --s1:#2a78d6;--s2:#eb6834;--s3:#1baf7a;--s4:#eda100;--s5:#e87ba4;
+  --good:#0ca30c;--warning:#fab219;--critical:#d03b3b}
+@media (prefers-color-scheme: dark){:root:where(:not([data-theme="light"])){color-scheme:dark;
+  --surface-0:#111110;--surface-1:#1a1a19;--line:#2e2e2c;--grid:#262624;
+  --text-primary:#ffffff;--text-secondary:#c3c2b7;--text-muted:#85847d;
+  --s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;--s5:#d55181}}
+:root[data-theme="dark"]{color-scheme:dark;
+  --surface-0:#111110;--surface-1:#1a1a19;--line:#2e2e2c;--grid:#262624;
+  --text-primary:#ffffff;--text-secondary:#c3c2b7;--text-muted:#85847d;
+  --s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;--s5:#d55181}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--surface-0);color:var(--text-primary);font:13px/1.45 system-ui,sans-serif}
+main{max-width:1400px;margin:0 auto;padding:14px 16px 12px;display:flex;flex-direction:column;gap:10px}
+header{display:flex;flex-wrap:wrap;gap:6px 18px;align-items:center}
+h1{font-size:18px;margin:0;font-weight:650}
+.pill{display:inline-flex;gap:6px;align-items:center;padding:3px 10px;border-radius:99px;border:1px solid var(--line);background:var(--surface-1);font-weight:600;font-size:12px}
+.pill i{width:8px;height:8px;border-radius:50%;display:inline-block}
+.ranges{display:flex;gap:4px;margin-left:auto}
+.ranges button{font:inherit;padding:4px 11px;border-radius:6px;border:1px solid var(--line);background:var(--surface-1);color:var(--text-secondary);cursor:pointer}
+.ranges button.on{background:var(--text-primary);color:var(--surface-1);border-color:var(--text-primary)}
+#meta{color:var(--text-muted);font-size:12px;width:100%}
+#err{color:var(--critical)}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px}
+.tile{background:var(--surface-1);border:1px solid var(--line);border-radius:10px;padding:9px 14px}
+.tile .k{color:var(--text-secondary);font-size:12px}
+.tile .v{font-size:26px;font-weight:650;letter-spacing:-.5px;font-variant-numeric:tabular-nums}
+.tile .v small{font-size:13px;font-weight:500;color:var(--text-secondary);margin-left:2px}
+.tile .s{color:var(--text-muted);font-size:12px}
+.card{background:var(--surface-1);border:1px solid var(--line);border-radius:10px;padding:12px 16px 8px;display:flex;flex-direction:column;min-height:0}
+
+.card h2{font-size:14px;margin:0 0 2px;font-weight:600}
+.card p.sub{margin:0 0 8px;color:var(--text-secondary);font-size:12px}
+.legend{display:flex;flex-wrap:wrap;gap:14px;font-size:12px;color:var(--text-secondary);margin-bottom:4px}
+.legend span{display:inline-flex;align-items:center;gap:6px}
+.legend i{width:14px;height:3px;border-radius:2px;display:inline-block}
+.legend i.dot{width:8px;height:8px;border-radius:50%}
+.legend i.band{height:10px;opacity:.25}
+.chart{position:relative;height:110px}
+.chart>svg{position:absolute;left:0;top:0;width:100%}
+svg{display:block;width:100%;overflow:visible}
+svg text{fill:var(--text-muted);font-size:11px;font-variant-numeric:tabular-nums}
+.tip{position:absolute;pointer-events:none;background:var(--surface-1);border:1px solid var(--line);border-radius:8px;padding:7px 10px;font-size:12px;box-shadow:0 6px 18px #0003;display:none;min-width:170px;z-index:2}
+.tip b{display:block;margin-bottom:3px;font-weight:600}
+.tip div{display:flex;justify-content:space-between;gap:14px;color:var(--text-secondary)}
+.tip div span:last-child{color:var(--text-primary);font-variant-numeric:tabular-nums}
+.tip i{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:5px}
+.where{display:grid;grid-template-columns:minmax(220px,1fr) 2fr;gap:6px 24px;align-items:center}
+@media (max-width:820px){.where{grid-template-columns:1fr}}
+.where .big{font-size:22px;font-weight:700;display:flex;align-items:center;gap:10px}
+.where .big i{width:12px;height:12px;border-radius:50%;flex:none}
+.where .why{color:var(--text-secondary);font-size:12px;margin-top:2px}
+.split{display:flex;height:26px;border-radius:6px;overflow:hidden;gap:2px;background:var(--surface-1)}
+.split div{display:flex;align-items:center;padding:0 8px;font-size:12px;font-weight:600;color:#fff;white-space:nowrap;overflow:hidden;min-width:4px}
+.split-legend{display:flex;justify-content:space-between;gap:10px;font-size:12px;color:var(--text-secondary);margin-top:5px;flex-wrap:wrap}
+.bystate{width:100%;margin-top:8px;font-size:12px}
+.bystate th,.bystate td{padding:2px 8px}
+.match-sw{width:14px;height:10px;display:inline-block;border-radius:2px;background:var(--s5);opacity:.25}
+.split-legend b{color:var(--text-primary);font-weight:600}
+.split-legend i{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:5px}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+@media (max-width:820px){.grid2{grid-template-columns:1fr}}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+th,td{text-align:right;padding:4px 8px;border-bottom:1px solid var(--grid)}
+th:first-child,td:first-child{text-align:left}
+th{color:var(--text-secondary);font-weight:500;font-size:12px}
+td i{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:7px}
+.verdict{font-size:12px;margin:6px 0 2px;color:var(--text-secondary);flex:none}
+.verdict b{color:var(--text-primary)}
+</style></head><body><main>
+<header>
+  <h1>Jitter</h1>
+  <span class="pill" id="status"><i></i><span>lade …</span></span>
+  <div class="ranges" id="ranges">
+    <button data-h="3">3 h</button><button data-h="24">24 h</button><button data-h="168">7 Tage</button><button data-h="0">Alles</button>
+  </div>
+  <div id="meta">lade …</div>
+</header>
+
+<section class="tiles" id="tiles"></section>
+
+<section class="card">
+  <div class="where">
+    <div><div class="big" id="wbig"><i></i><span>lade …</span></div><div class="why" id="wwhy"></div></div>
+    <div><div class="split" id="wsplit"></div><div class="split-legend" id="wleg"></div>
+      <table class="bystate" id="bystate"></table></div>
+  </div>
+</section>
+
+<section class="card grow">
+  <h2 id="h1">Ping zum Spielserver – was das Spiel spürt</h2>
+  <p class="sub"><span id="src">Pro Minute 55 Pings.</span> Fläche = schnellstes Paket bis p95, Linie = p95, Punkte = langsamstes Paket.</p>
+  <div class="legend"><span><i class="band" style="background:var(--s1)"></i>min – p95</span><span><i style="background:var(--s1)"></i>p95</span><span><i class="dot" style="background:var(--critical)"></i>Ausreißer &gt; 15 ms über min</span><span><span class="match-sw"></span>im Match (CS2)</span></div>
+  <div class="chart" id="c1"></div>
+</section>
+
+<div class="grid2">
+  <section class="card">
+    <h2>Wo entsteht der Jitter?</h2>
+    <p class="sub">Spanne p95 − min je Strecke. Heimnetz flach, Provider so hoch wie Spielserver = es passiert beim Anschluss.</p>
+    <div class="legend" id="l2"></div>
+    <div class="chart" id="c2"></div>
+    <p class="verdict" id="verdict"></p>
+  </section>
+  <section class="card">
+    <h2>Tagesprofil – Provider</h2>
+    <p class="sub">Anteil der Minuten mit Ausreißern je Uhrzeit (alle Messtage). Abends höher = überlastetes Netz beim Provider.</p>
+    <div class="chart" id="c3"></div>
+  </section>
+</div>
+
+<section class="card">
+  <h2>Zusammenfassung</h2>
+  <p class="sub" id="tsub"></p>
+  <table id="tbl"></table>
+</section>
+</main>
+<script>
+const SPIKE = 15;
+const T = [
+  {key:'isp', name:'Provider (1. Knoten)', col:'--s1'},
+  {key:'game', name:'Spielserver', col:'--s2'},
+  {key:'cloudflare', name:'Cloudflare 1.1.1.1', col:'--s3'},
+];
+const WL = {key:'lan', name:'Heimnetz (PC → Router)', col:'--s4'};
+const PV = {key:'pc-game', name:'PC → Spielserver (wie im Spiel)', col:'--s5'};
+const CMP = [...T, WL];
+let ALL = [...T, WL], GAME = 'Spielserver', ROUTER = false;
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const fmt = (v, d=1) => v == null || isNaN(v) ? '—' : v.toFixed(d).replace('.', ',');
+const pad = n => String(n).padStart(2,'0');
+const tlabel = (ms, long) => { const d = new Date(ms); return (long ? pad(d.getDate())+'.'+pad(d.getMonth()+1)+'. ' : '') + pad(d.getHours())+':'+pad(d.getMinutes()); };
+let DATA = null, RANGE = 0, CS2 = new Map();
+const ST = {match:'Match', menu:'Menü', aus:'CS2 aus'};
+const csState = t => CS2.get(Math.floor(t / 60e3) * 60e3);
+try { const r = localStorage.getItem('range'); if (r !== null) RANGE = +r; } catch (e) {}
+document.querySelectorAll('#ranges button').forEach(x => x.classList.toggle('on', +x.dataset.h === RANGE));
+
+// rows: [t, ziel, sent, recv, min, med, p95, max, jit]
+function rowsFor(key, from){
+  return DATA.rows.filter(r => r[1]===key).map(r => ({t:+new Date(r[0]), sent:r[2], recv:r[3], min:r[4], med:r[5], p95:r[6], max:r[7], jit:r[8]}))
+    .filter(r => r.t >= from);
+}
+function bucket(rs, n){
+  if (rs.length <= n) return rs.filter(r => r.recv);
+  const t0 = rs[0].t, w = (rs[rs.length-1].t - t0) / n + 1, out = [];
+  let cur = null;
+  for (const r of rs){
+    const b = Math.floor((r.t - t0)/w);
+    if (!cur || cur.b !== b){ cur && out.push(fin(cur)); cur = {b, t:r.t, n:0, min:1e9, p95:0, max:0, jit:0, spr:0, sent:0, recv:0, med:[]}; }
+    cur.sent += r.sent; cur.recv += r.recv;
+    if (!r.recv) continue;
+    cur.n++; cur.min = Math.min(cur.min, r.min); cur.p95 += r.p95; cur.max = Math.max(cur.max, r.max); cur.jit += r.jit||0; cur.spr += r.p95 - r.min; cur.med.push(r.med);
+  }
+  cur && out.push(fin(cur));
+  return out.filter(x => x.n);
+  function fin(c){ c.med.sort((a,b)=>a-b); return {t:c.t, min:c.min, p95:c.p95/c.n, max:c.max, jit:c.jit/c.n, spr:c.spr/c.n, med:c.med[c.med.length>>1], sent:c.sent, recv:c.recv, n:c.n}; }
+}
+function summary(rs){
+  const ok = rs.filter(r => r.recv); if (!ok.length) return null;
+  const sent = rs.reduce((a,r)=>a+r.sent,0), recv = rs.reduce((a,r)=>a+r.recv,0);
+  const med = ok.map(r=>r.med).sort((a,b)=>a-b)[ok.length>>1];
+  return {med, p95: ok.reduce((a,r)=>a+r.p95,0)/ok.length, max: Math.max(...ok.map(r=>r.max)),
+    jit: ok.reduce((a,r)=>a+(r.jit||0),0)/ok.length, spr: ok.reduce((a,r)=>a+r.p95-r.min,0)/ok.length,
+    loss: sent ? 100*(sent-recv)/sent : 0, spiky: ok.filter(r => r.max - r.min > SPIKE).length, minutes: rs.length};
+}
+
+// ---------- SVG-Helfer ----------
+const NS = 'http://www.w3.org/2000/svg';
+function el(tag, attrs, parent){ const e = document.createElementNS(NS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); parent && parent.appendChild(e); return e; }
+function niceMax(v){ const s = [20,40,60,80,100,120,160,200,300,400,600]; return s.find(x => x >= v) || Math.ceil(v/100)*100; }
+function frame(box, H, yMax, xs, long){
+  box.innerHTML = ''; H = Math.max(100, box.clientHeight);
+  const W = box.clientWidth, m = {l:46, r:8, t:6, b:20};
+  const svg = el('svg', {viewBox:`0 0 ${W} ${H}`, style:`height:${H}px`}, box);
+  const x = t => m.l + (xs[1]===xs[0] ? 0 : (t - xs[0]) / (xs[1]-xs[0]) * (W - m.l - m.r));
+  const y = v => m.t + (1 - v / yMax) * (H - m.t - m.b);
+  for (let i = 0; i <= 4; i++){
+    const v = yMax*i/4, yy = y(v);
+    el('line', {x1:m.l, x2:W-m.r, y1:yy, y2:yy, stroke:css('--grid'), 'stroke-width':1}, svg);
+    el('text', {x:m.l-6, y:yy+4, 'text-anchor':'end'}, svg).textContent = Math.round(v) + (i === 4 ? ' ms' : '');
+  }
+  const n = Math.max(2, Math.floor((W - m.l - m.r)/110));
+  for (let i = 0; i <= n; i++){
+    const t = xs[0] + (xs[1]-xs[0])*i/n;
+    el('text', {x:x(t), y:H-4, 'text-anchor': i===0?'start':i===n?'end':'middle'}, svg).textContent = tlabel(t, long);
+  }
+  const tip = document.createElement('div'); tip.className = 'tip'; box.appendChild(tip);
+  return {svg, x, y, W, H, m, tip};
+}
+function hover(f, pts, html){
+  const cross = el('line', {y1:f.m.t, y2:f.H-f.m.b, stroke:css('--text-muted'), 'stroke-width':1, 'stroke-dasharray':'3 3', visibility:'hidden'}, f.svg);
+  const hit = el('rect', {x:f.m.l, y:0, width:f.W-f.m.l-f.m.r, height:f.H, fill:'transparent'}, f.svg);
+  hit.addEventListener('mousemove', ev => {
+    const r = f.svg.getBoundingClientRect(), mx = (ev.clientX - r.left) * f.W / r.width;
+    let best = 0, bd = 1e9;
+    pts.forEach((p,i) => { const d = Math.abs(f.x(p.t) - mx); if (d < bd){ bd = d; best = i; } });
+    const p = pts[best], px = f.x(p.t);
+    cross.setAttribute('x1', px); cross.setAttribute('x2', px); cross.setAttribute('visibility', 'visible');
+    f.tip.innerHTML = html(p); f.tip.style.display = 'block';
+    const tw = f.tip.offsetWidth, left = px / f.W * r.width;
+    f.tip.style.left = (left + 14 + tw > r.width ? left - tw - 14 : left + 14) + 'px';
+    f.tip.style.top = '8px';
+  });
+  hit.addEventListener('mouseleave', () => { cross.setAttribute('visibility','hidden'); f.tip.style.display = 'none'; });
+}
+const row = (k, v) => `<div><span>${k}</span><span>${v}</span></div>`;
+
+// ---------- Diagramme ----------
+function chartGame(from, xs, long){
+  const box = document.getElementById('c1');
+  const pts = bucket(rowsFor('game', from), Math.floor(box.clientWidth / 3));
+  if (pts.length < 2){ box.innerHTML = '<p class="sub">Noch zu wenig Messungen in diesem Zeitraum.</p>'; return; }
+  const yMax = niceMax(Math.max(...pts.map(p => p.max)));
+  const f = frame(box, 240, yMax, xs, long);
+  const band = pts.map(p => `${f.x(p.t)},${f.y(p.p95)}`).join(' ') + ' ' + pts.slice().reverse().map(p => `${f.x(p.t)},${f.y(p.min)}`).join(' ');
+  for (const [t, c] of CS2){
+    if (c.st !== 'match' || t < xs[0] - 60e3 || t > xs[1]) continue;
+    const x0 = Math.max(f.m.l, f.x(t)), x1 = Math.min(f.W - f.m.r, f.x(t + 60e3));
+    if (x1 > x0) el('rect', {x:x0, y:f.m.t, width:x1 - x0 + .5, height:f.H - f.m.t - f.m.b, fill:css('--s5'), 'fill-opacity':.14}, f.svg);
+  }
+  el('polygon', {points:band, fill:css('--s1'), 'fill-opacity':.2}, f.svg);
+  el('polyline', {points:pts.map(p => `${f.x(p.t)},${f.y(p.p95)}`).join(' '), fill:'none', stroke:css('--s1'), 'stroke-width':2, 'stroke-linejoin':'round'}, f.svg);
+  for (const p of pts){
+    const hot = p.max - p.min > SPIKE;
+    el('circle', {cx:f.x(p.t), cy:f.y(p.max), r:hot?3:1.8, fill:hot?css('--critical'):css('--text-muted'), 'fill-opacity':hot?1:.5, stroke:css('--surface-1'), 'stroke-width':hot?1:0}, f.svg);
+  }
+  hover(f, pts, p => `<b>${tlabel(p.t, long)}${p.n>1?' · Ø '+p.n+' min':''}</b>` + row('schnellstes', fmt(p.min)+' ms') + row('Median', fmt(p.med)+' ms') + row('p95', fmt(p.p95)+' ms') + row('langsamstes', fmt(p.max)+' ms') + row('Jitter', fmt(p.jit)+' ms') + row('Verlust', fmt(p.sent?100*(p.sent-p.recv)/p.sent:0)+' %') + (p.n === 1 && csState(p.t) ? row('CS2', csState(p.t).st === 'match' ? 'Match · ' + csState(p.t).map : ST[csState(p.t).st]) : ''));
+}
+
+function chartCompare(from, xs, long){
+  const box = document.getElementById('c2');
+  const n = Math.floor(box.clientWidth / 5);
+  const ser = CMP.map(s => ({...s, pts: bucket(rowsFor(s.key, from), n).map(p => ({...p, spr: p.spr ?? p.p95 - p.min}))}));
+  document.getElementById('l2').innerHTML = ser.map(s => `<span><i style="background:var(${s.col})"></i>${s.name}</span>`).join('');
+  if (ser.every(s => s.pts.length < 2)){ box.innerHTML = '<p class="sub">Noch zu wenig Messungen.</p>'; return; }
+  const yMax = niceMax(Math.max(SPIKE, ...ser.flatMap(s => s.pts.map(p => p.spr))));
+  const f = frame(box, 200, yMax, xs, long);
+  el('line', {x1:f.m.l, x2:f.W-f.m.r, y1:f.y(SPIKE), y2:f.y(SPIKE), stroke:css('--critical'), 'stroke-dasharray':'4 4', 'stroke-opacity':.6}, f.svg);
+  for (const s of ser.slice().reverse())
+    el('polyline', {points:s.pts.map(p => `${f.x(p.t)},${f.y(p.spr)}`).join(' '), fill:'none', stroke:css(s.col), 'stroke-width':2, 'stroke-linejoin':'round', 'stroke-opacity':.9}, f.svg);
+  const base = ser[1].pts.length ? ser[1].pts : ser[0].pts;
+  hover(f, base, p => {
+    let h = `<b>${tlabel(p.t, long)}</b>`;
+    for (const s of ser){
+      let q = null, bd = 1e18; for (const x of s.pts){ const d = Math.abs(x.t - p.t); if (d < bd){ bd = d; q = x; } }
+      h += `<div><span><i style="background:var(${s.col})"></i>${s.name}</span><span>${q ? fmt(q.spr)+' ms' : '—'}</span></div>`;
+    }
+    return h;
+  });
+}
+
+function chartProfile(){
+  const box = document.getElementById('c3');
+  const rs = rowsFor('isp', 0).filter(r => r.recv);
+  const hours = Array.from({length:24}, (_, h) => { const x = rs.filter(r => new Date(r.t).getHours() === h); return {h, n:x.length, pct: x.length ? 100*x.filter(r => r.max - r.min > SPIKE).length/x.length : null, spr: x.length ? x.reduce((a,r)=>a+r.p95-r.min,0)/x.length : null}; });
+  box.innerHTML = '';
+  const W = box.clientWidth, H = Math.max(100, box.clientHeight), m = {l:46, r:8, t:6, b:20};
+  const yMax = niceMax(Math.max(10, ...hours.map(h => h.pct || 0)));
+  const svg = el('svg', {viewBox:`0 0 ${W} ${H}`, style:`height:${H}px`}, box);
+  const y = v => m.t + (1 - v / yMax) * (H - m.t - m.b);
+  for (let i = 0; i <= 4; i++){ const v = yMax*i/4; el('line', {x1:m.l, x2:W-m.r, y1:y(v), y2:y(v), stroke:css('--grid')}, svg); el('text', {x:m.l-6, y:y(v)+4, 'text-anchor':'end'}, svg).textContent = Math.round(v) + (i === 4 ? ' %' : ''); }
+  const bw = (W - m.l - m.r) / 24;
+  const tip = document.createElement('div'); tip.className = 'tip'; box.appendChild(tip);
+  for (const h of hours){
+    const x0 = m.l + h.h*bw + 1, w = bw - 2;
+    if (h.h % 3 === 0) el('text', {x:x0 + w/2, y:H-4, 'text-anchor':'middle'}, svg).textContent = h.h + ' h';
+    if (h.pct === null){ el('rect', {x:x0, y:y(0)-2, width:w, height:2, fill:css('--grid')}, svg); }
+    else {
+      const top = y(Math.max(h.pct, yMax*0.01)), r = Math.min(4, w/2);
+      el('path', {d:`M${x0},${y(0)} V${top+r} Q${x0},${top} ${x0+r},${top} H${x0+w-r} Q${x0+w},${top} ${x0+w},${top+r} V${y(0)} Z`, fill:css('--s1')}, svg);
+    }
+    const hit = el('rect', {x:m.l + h.h*bw, y:0, width:bw, height:H, fill:'transparent'}, svg);
+    hit.addEventListener('mousemove', () => {
+      tip.innerHTML = `<b>${pad(h.h)}:00 – ${pad(h.h)}:59</b>` + (h.n ? row('Minuten mit Ausreißern', fmt(h.pct,0)+' %') + row('Ø Spanne p95 − min', fmt(h.spr)+' ms') + row('gemessene Minuten', h.n) : row('noch keine Messung', ''));
+      tip.style.display = 'block';
+      const left = (m.l + h.h*bw + bw/2) / W * box.clientWidth, tw = tip.offsetWidth;
+      tip.style.left = (left + 12 + tw > box.clientWidth ? left - tw - 12 : left + 12) + 'px'; tip.style.top = '8px';
+    });
+    hit.addEventListener('mouseleave', () => tip.style.display = 'none');
+  }
+}
+
+// ---------- Kopf, Kacheln, Tabelle ----------
+function render(){
+  if (!DATA) return;
+  const now = +new Date(DATA.now);
+  const all = DATA.rows.length ? +new Date(DATA.rows[0][0]) : now;
+  const from = RANGE ? now - RANGE*3600e3 : all;
+  const xs = [Math.max(from, all), now], long = (xs[1]-xs[0]) > 20*3600e3;
+
+  const gameAll = rowsFor('game', 0), last = gameAll[gameAll.length-1];
+  const stale = !last || now - last.t > 5*60e3;
+  const spread = last && last.recv ? last.p95 - last.min : null;
+  let st = ['--text-muted', 'Keine aktuellen Messungen'];
+  if (!stale){
+    if (last.recv < last.sent) st = ['--critical', 'Paketverlust'];
+    else if (spread > SPIKE) st = ['--critical', 'Unruhig'];
+    else if (spread > 8) st = ['--warning', 'Leicht unruhig'];
+    else st = ['--good', 'Stabil'];
+  }
+  const pill = document.getElementById('status');
+  pill.querySelector('i').style.background = css(st[0]);
+  pill.querySelector('span').textContent = st[1] + (stale ? '' : ' · letzte Minute ' + tlabel(last.t));
+
+  const S = Object.fromEntries(ALL.map(s => [s.key, summary(rowsFor(s.key, from))]));
+  const v = S.game, vf = S.isp;
+  const rl = RANGE ? (RANGE < 24 ? `letzte ${RANGE} h` : RANGE === 24 ? 'letzte 24 h' : 'letzte 7 Tage') : 'gesamter Zeitraum';
+  document.getElementById('tiles').innerHTML = [
+    ['Jitter jetzt', stale ? '—' : fmt(last.jit), 'ms', stale ? '' : 'Spanne p95 − min ' + fmt(spread) + ' ms'],
+    ['Ø Jitter', v ? fmt(v.jit) : '—', 'ms', rl],
+    ['Minuten mit Ausreißern', v ? fmt(100*v.spiky/v.minutes, 0) : '—', '%', v ? `${v.spiky} von ${v.minutes} min · ${GAME}` : ''],
+    ['Paketverlust', v ? fmt(v.loss, 2) : '—', '%', rl],
+  ].map(t => `<div class="tile"><div class="k">${t[0]}</div><div class="v">${t[1]}<small>${t[1]==='—'?'':t[2]}</small></div><div class="s">${t[3]}</div></div>`).join('');
+
+  const verdict = document.getElementById('verdict');
+  if (v && vf){
+    const share = Math.min(100, Math.round(100 * vf.spr / v.spr));
+    verdict.innerHTML = `Ø Spanne Provider <b>${fmt(vf.spr)} ms</b> · ${GAME} <b>${fmt(v.spr)} ms</b> → <b>≈ ${share} %</b> entstehen schon ${ROUTER ? 'zwischen Modem und Provider' : 'bis zum Provider (inkl. Heimnetz)'}`;
+  } else verdict.textContent = '';
+
+  document.getElementById('tsub').textContent = rl + ' · Spanne = p95 − schnellstes Paket je Minute, Ausreißer = langsamstes Paket > ' + SPIKE + ' ms über dem schnellsten';
+  document.getElementById('tbl').innerHTML = '<tr><th>Ziel</th><th>Median</th><th>Ø p95</th><th>max</th><th>Ø Jitter</th><th>Ø Spanne</th><th>Ausreißer-Min.</th><th>Verlust</th></tr>' +
+    ALL.map(s => { const x = S[s.key]; return `<tr><td><i style="background:var(${s.col})"></i>${s.name}</td>` + (x ? `<td>${fmt(x.med)} ms</td><td>${fmt(x.p95)} ms</td><td>${fmt(x.max)} ms</td><td>${fmt(x.jit)} ms</td><td>${fmt(x.spr)} ms</td><td>${x.spiky} / ${x.minutes}</td><td>${fmt(x.loss,2)} %</td>` : '<td colspan="7">—</td>') + '</tr>'; }).join('');
+
+  const days = ((now - all) / 864e5);
+  whereView(S, from);
+
+  // Diagramme zuletzt: ihre Höhe hängt vom Platz ab, den Texte und Tabelle übrig lassen
+  LAST = [from, xs, long];
+  drawCharts();
+
+  document.getElementById('meta').innerHTML = `Messung seit ${tlabel(all, true)} (${fmt(days, 1)} Tage, ${new Set(DATA.rows.map(r => r[0])).size} Minuten) · Stand ${tlabel(now)} · aktualisiert jede Minute` + (DATA.error ? ` · <span id="err">${DATA.error}</span>` : '');
+}
+
+// ---------- Intern oder extern? ----------
+// intern = PC → Router (Heimnetz, vom PC gemessen), extern = Router → Spielserver (vom Router gemessen).
+// Ohne Router-Messung misst der PC den ganzen Weg; extern ≈ Spanne PC → Spielserver minus Heimnetz.
+// Maß: Ø Spanne p95 − schnellstes Paket je Minute, also wie stark die Laufzeit schwankt.
+function whereView(S, from){
+  // extern nur über die Minuten vergleichen, in denen der PC auch gemessen hat (PC kann aus sein)
+  const wt = new Set(rowsFor('lan', from).map(r => r.t));
+  const W = S.lan, G = (W && summary(rowsFor('game', from).filter(r => wt.has(r.t)))) || S.game,
+    E = G && W && !ROUTER ? {...G, spr: Math.max(0, G.spr - W.spr)} : G, big = document.getElementById('wbig'), why = document.getElementById('wwhy');
+  const set = (col, text, sub) => { big.querySelector('i').style.background = css(col); big.querySelector('span').textContent = text; why.innerHTML = sub; };
+  const pct = x => x ? 100 * x.spiky / x.minutes : 0;
+  const spk = x => x.minutes < 10 ? `${x.spiky} von ${x.minutes} Min. mit Ausreißern` : `${fmt(pct(x),0)} % Minuten mit Ausreißern`;
+  if (!E){ set('--text-muted', 'Noch keine Daten', ''); document.getElementById('wsplit').innerHTML = ''; document.getElementById('wleg').innerHTML = ''; return; }
+  if (!W){
+    set('--text-muted', 'Intern noch nicht gemessen', 'Die PC-Messung (Heimnetz) läuft im Hintergrund und liefert ab der nächsten vollen Minute Werte. Extern schwankt es gerade um Ø ' + fmt(E.spr) + ' ms.');
+  } else {
+    const share = W.spr / (W.spr + E.spr);
+    const sub = `Intern schwankt es um Ø <b>${fmt(W.spr)} ms</b> (${spk(W)}), extern um Ø <b>${fmt(E.spr)} ms</b> (${spk(E)}).`;
+    if (E.spr < 6 && W.spr < 3 && E.loss < 0.5 && W.loss < 0.5) set('--good', 'Kein Problem – stabil', sub);
+    else if (share < 0.25) set('--critical', `Extern – ${Math.round(100*(1-share))} % außerhalb`, sub + ' Das Heimnetz ist sauber, die Schwankung kommt aus dem Internet-Anschluss oder dahinter.');
+    else if (share > 0.6) set('--critical', `Intern – ${Math.round(100*share)} % im Heimnetz`, sub + ' Die Schwankung entsteht zwischen PC und Router: WLAN-Empfang, Störungen oder Hintergrund-Scans.');
+    else set('--warning', 'Beides – intern und extern', sub + ' Heimnetz und Internet-Anschluss tragen beide spürbar bei.');
+  }
+  const wi = W ? W.spr : 0, ex = E.spr, tot = wi + ex || 1;
+  document.getElementById('wsplit').innerHTML =
+    `<div style="flex:${Math.max(wi/tot, .02)};background:var(--s4)" title="Intern">${wi/tot > .12 ? 'Intern ' + Math.round(100*wi/tot) + ' %' : ''}</div>` +
+    `<div style="flex:${Math.max(ex/tot, .02)};background:var(--s1)" title="Extern">${ex/tot > .12 ? 'Extern ' + Math.round(100*ex/tot) + ' %' : ''}</div>`;
+  const P = S['pc-game'];
+  byState(from);
+  document.getElementById('wleg').innerHTML =
+    `<span><i style="background:var(--s4)"></i>Intern · PC → Router <b>${W ? fmt(W.spr) + ' ms' : '—'}</b>${W && W.loss ? ' · Verlust ' + fmt(W.loss,2) + ' %' : ''}</span>` +
+    `<span><i style="background:var(--s1)"></i>Extern · Router → ${GAME}${ROUTER ? '' : ' (geschätzt)'} <b>${fmt(E.spr)} ms</b>${E.loss ? ' · Verlust ' + fmt(E.loss,2) + ' %' : ''}</span>` +
+    (P ? `<span>Zusammen (PC → ${GAME}, wie im Spiel) <b>${fmt(P.spr)} ms</b></span>` : '');
+}
+
+// Gleiche Auswertung getrennt nach CS2-Zustand: stört das Menü oder ein Match das Heimnetz?
+function byState(from){
+  const tb = document.getElementById('bystate');
+  if (!CS2.size){ tb.innerHTML = '<tr><td style="text-align:left;color:var(--text-muted)">Menü/Match-Vergleich: wartet auf Meldungen von CS2 (einmal neu starten, damit die Game State Integration lädt).</td></tr>'; return; }
+  const cols = ['menu', 'match', 'aus'];
+  const by = k => Object.fromEntries(cols.map(c => [c, summary(rowsFor(k, from).filter(r => (csState(r.t) || {}).st === c))]));
+  const W = by('lan'), E = by('game');
+  const cell = x => x ? fmt(x.spr) + ' ms' : '—';
+  tb.innerHTML = `<tr><th>Ø Spanne nach CS2-Zustand</th>${cols.map(c => `<th>${ST[c]}</th>`).join('')}</tr>` +
+    `<tr><td><i style="background:var(--s4)"></i>Intern (Heimnetz)</td>${cols.map(c => `<td>${cell(W[c])}</td>`).join('')}</tr>` +
+    `<tr><td><i style="background:var(--s1)"></i>${ROUTER ? 'Extern (Router → ' + GAME + ')' : 'Ganzer Weg (PC → ' + GAME + ')'}</td>${cols.map(c => `<td>${cell(E[c])}</td>`).join('')}</tr>` +
+    `<tr><td style="color:var(--text-muted)">Minuten (PC-Messung)</td>${cols.map(c => `<td style="color:var(--text-muted)">${W[c] ? W[c].minutes : 0}</td>`).join('')}</tr>`;
+}
+
+let LAST = null;
+function setup(){
+  ROUTER = DATA.mode === 'router'; GAME = DATA.gameName || 'Spielserver';
+  T[1].name = GAME; ALL = ROUTER ? [...T, WL, PV] : [...T, WL];
+  document.getElementById('h1').textContent = 'Ping zu ' + GAME + ' – was das Spiel spürt';
+  document.getElementById('src').textContent = 'Pro Minute 55 Pings vom ' + (ROUTER ? 'Router.' : 'PC.');
+}
+// Diagrammhöhen so wählen, dass die Seite genau ins Fenster passt (min. 110 px, sonst wird gescrollt)
+function fitCharts(){
+  const c1 = document.getElementById('c1'), c23 = [document.getElementById('c2'), document.getElementById('c3')];
+  c1.style.height = '110px'; c23.forEach(c => c.style.height = '110px');
+  const extra = Math.max(0, innerHeight - document.querySelector('main').offsetHeight);
+  c1.style.height = (110 + Math.round(extra * 0.55)) + 'px';
+  c23.forEach(c => c.style.height = (110 + Math.round(extra * 0.45)) + 'px');
+}
+function drawCharts(){ if (!LAST) return; fitCharts(); const [from, xs, long] = LAST; chartGame(from, xs, long); chartCompare(from, xs, long); chartProfile(); }
+async function load(){
+  try { DATA = await (await fetch('/data')).json(); setup(); CS2 = new Map((DATA.cs2 || []).map(r => [+new Date(r[0]), {st:r[1], map:r[2], mode:r[3]}])); render(); }
+  catch (e) { document.getElementById('meta').innerHTML = '<span id="err">Server nicht erreichbar – Fenster neu öffnen</span>'; }
+}
+document.getElementById('ranges').addEventListener('click', e => {
+  const b = e.target.closest('button'); if (!b) return;
+  RANGE = +b.dataset.h;
+  try { localStorage.setItem('range', RANGE); } catch (e) {}
+  document.querySelectorAll('#ranges button').forEach(x => x.classList.toggle('on', x === b));
+  render();
+});
+let rt; addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(drawCharts, 80); });
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', render);
+load(); setInterval(load, 60e3); setInterval(() => fetch('/alive').catch(()=>{}), 15e3);
+</script></body></html>
+'''
+
+if __name__ == "__main__":
+    if "--serve" in sys.argv:
+        serve()
+        sys.exit()
+    if not port_in_use():
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), "--serve"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        for _ in range(30):
+            if port_in_use():
+                break
+            time.sleep(0.1)
+    if "--no-open" not in sys.argv:
+        subprocess.Popen(["omarchy", "launch", "webapp", f"http://127.0.0.1:{PORT}"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)

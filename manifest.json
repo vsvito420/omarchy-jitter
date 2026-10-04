@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "vsvito.jitter",
+  "name": "Jitter",
+  "version": "1.0.0",
+  "author": "vsvito",
+  "description": "Ping jitter to your router, your provider and the game server, logged every minute",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Jitter.qml"
+  },
+  "barWidget": {
+    "displayName": "Jitter",
+    "description": "Ping jitter to the game server, with history and hour-of-day profile",
+    "category": "System",
+    "allowMultiple": false
+  }
+}

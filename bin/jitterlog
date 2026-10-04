@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""jitterlog – misst jede Minute 55 Pings je Ziel vom PC aus (systemd-User-Dienst jitterlog.service).
+
+Ziele:
+  lan         Router (Default-Gateway)      = dein Heimnetz / WLAN
+  isp         erster Knoten beim Provider   = dein Internet-Anschluss
+  game        GAME_HOST (Valve Frankfurt)   = der ganze Weg, wie ihn das Spiel spürt
+  cloudflare  1.1.1.1                       = Gegenprobe
+Misst der Router selbst mit (ROUTER in der Config), übernimmt er isp/game/cloudflare ohne
+WLAN dazwischen; der PC misst dann nur lan und pc-game.
+Ergebnis: ~/.local/state/jitterlog/pc-YYYY-MM.csv
+  zeit,ziel,ip,gesendet,empfangen,min,median,p95,max,jitter
+
+Außerdem nimmt er auf 127.0.0.1:3010 die Game State Integration von CS2 entgegen
+(cs2/gamestate_integration_jitterlog.cfg) und schreibt pro Minute, ob CS2 aus, im Menü
+oder in einem Match war → cs2-YYYY-MM.txt (zeit,zustand,map,modus,sek_match).
+"""
+import http.server, json, os, re, subprocess, sys, threading, time
+from collections import Counter
+from datetime import datetime
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from jitterlog_common import HEADER, STATE, config, find_isp_hop  # noqa: E402
+
+N = 55
+GSI_PORT = 3010
+GSI_STALE = 30  # CS2 schickt alle 10 s einen Heartbeat; länger still = CS2 zu
+
+gsi = {"t": 0, "map": None, "mode": None}
+seconds = Counter()      # Sekunden je Zustand in der laufenden Minute
+match_info = Counter()   # (map, modus) -> Sekunden
+lock = threading.Lock()
+
+
+class GSI(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        try:
+            d = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+        except ValueError:
+            d = {}
+        m = d.get("map") or {}
+        with lock:
+            gsi.update(t=time.time(), map=m.get("name"), mode=m.get("mode"))
+        self.send_response(200)
+        self.end_headers()
+
+
+def current_state():
+    with lock:
+        if time.time() - gsi["t"] > GSI_STALE:
+            return "aus", None
+        if gsi["map"]:
+            return "match", (gsi["map"], gsi["mode"] or "")
+        return "menu", None
+
+
+def sampler():
+    while True:
+        st, info = current_state()
+        with lock:
+            seconds[st] += 1
+            if info:
+                match_info[info] += 1
+        time.sleep(1)
+
+
+def gateway():
+    r = subprocess.run(["ip", "-4", "route", "show", "default"], capture_output=True, text=True)
+    m = re.search(r"via ([\d.]+)", r.stdout)
+    return m.group(1) if m else None
+
+
+def measure(name, host, ts, out):
+    if not host:
+        return
+    r = subprocess.run(["ping", "-n", "-c", str(N), "-w", "58", host], capture_output=True, text=True)
+    t = [float(x) for x in re.findall(r"time=([\d.]+)", r.stdout)]
+    if not t:
+        out.append(f"{ts},{name},{host},{N},0,,,,,\n")
+        return
+    jit = sum(abs(a - b) for a, b in zip(t, t[1:])) / (len(t) - 1) if len(t) > 1 else 0
+    s = sorted(t)
+    p95 = s[max(0, min(len(s) - 1, round(len(s) * 0.95) - 1))]
+    out.append(f"{ts},{name},{host},{N},{len(t)},{s[0]:.1f},{s[(len(s) - 1) // 2]:.1f},{p95:.1f},{s[-1]:.1f},{jit:.1f}\n")
+
+
+def append(path, header, rows):
+    new = not os.path.exists(path)
+    with open(path, "a") as f:
+        if new:
+            f.write(header)
+        f.writelines(rows)
+
+
+def main():
+    os.makedirs(STATE, exist_ok=True)
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", GSI_PORT), GSI)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    threading.Thread(target=sampler, daemon=True).start()
+    isp, isp_at = None, 0
+    while True:
+        time.sleep(60 - time.time() % 60)  # immer zur vollen Minute, wie der Router
+        cfg = config()
+        now = datetime.now()
+        ts, rows = now.strftime("%Y-%m-%dT%H:%M"), []
+        # Zustand der vergangenen Minute abschließen
+        with lock:
+            sec, info = dict(seconds), match_info.most_common(1)
+            seconds.clear()
+            match_info.clear()
+        prev = datetime.fromtimestamp(time.time() - 30).strftime("%Y-%m-%dT%H:%M")
+        if sec:
+            st = max(sec, key=sec.get)
+            m, mode = info[0][0] if info else ("", "")
+            append(os.path.join(STATE, f"cs2-{now:%Y-%m}.txt"), "zeit,zustand,map,modus,sek_match\n",
+                   [f"{prev},{st},{m},{mode},{sec.get('match', 0)}\n"])
+        # Pings für die neue Minute
+        targets = [("lan", gateway())]
+        if cfg["ROUTER"]:
+            targets.append(("pc-game", cfg["GAME_HOST"]))
+        else:
+            if not cfg["ISP_HOST"] and (not isp or time.time() - isp_at > 3600):
+                isp, isp_at = find_isp_hop() or isp, time.time()
+            targets += [("isp", cfg["ISP_HOST"] or isp), ("game", cfg["GAME_HOST"]), ("cloudflare", "1.1.1.1")]
+        th = [threading.Thread(target=measure, args=(n, h, ts, rows)) for n, h in targets]
+        for x in th:
+            x.start()
+        for x in th:
+            x.join()
+        append(os.path.join(STATE, f"pc-{now:%Y-%m}.csv"), HEADER, sorted(rows, key=lambda r: r.split(",")[1]))
+
+
+if __name__ == "__main__":
+    main()
